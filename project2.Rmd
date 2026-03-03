@@ -83,3 +83,49 @@ top_vars <- broom::tidy(step_model) %>%
 top_vars
 ```
 
+Part 2: Regularization and 5-fold cross validation
+
+our outcome is continuous so we will be using ridge and lasso
+```{r}
+# exclude price and log_price from predictors
+x_train <- model.matrix(log_price ~ . - price - log_price, data = train)[, -1]
+y_train <- train$log_price
+
+x_test <- model.matrix(log_price ~ . - price - log_price, data = test)[, -1]
+y_test <- test$log_price
+
+# 5-fold CV for Ridge Regression
+set.seed(5703)
+cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0, nfolds = 5)
+plot(cv_ridge)
+title("Ridge Regression CV Error Curve")
+
+# Optimal lambdas
+cv_ridge$lambda.min
+cv_ridge$lambda.1se
+
+# Ridge coefficients at lambda.min
+coef(cv_ridge, s = "lambda.min")
+
+
+# 5-fold CV for LASSO Regression
+set.seed(5703)
+cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 5)
+plot(cv_lasso)
+title("LASSO Regression CV Error Curve")
+
+# Optimal lambdas
+cv_lasso$lambda.min
+cv_lasso$lambda.1se
+
+# LASSO coefficients at lambda.min
+lasso_coef <- coef(cv_lasso, s = "lambda.min")
+lasso_coef
+
+# Which predictors are zero
+zero_predictors <- rownames(lasso_coef)[lasso_coef[, 1] == 0]
+zero_predictors
+```
+
+Part 3: Model performance evaluation and final choice 
+In the written report.
