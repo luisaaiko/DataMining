@@ -4,6 +4,16 @@ author: "Group 6: Cristhian Cruz, Julian McKinley, Luisa Ribeiro, Matheus Lucena
 date: "2026-03-03"
 output: html_document
 ---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      results = "hold",
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+# Project part 2
+
+## Setup and data cleaning
 ```{r}
 suppressPackageStartupMessages({
   library(tidyverse)
@@ -19,11 +29,8 @@ df_raw <- read.csv("kc_house_data.csv")
 ```
 
 ```{r}
-# Clean Types + Drop ID/Date From Modeling
-df <- df_raw
-
 # Convert likely categorical predictors
-df <- df %>%
+df <- df_raw %>%
   mutate(
     zipcode = if ("zipcode" %in% names(.)) as.factor(zipcode) else NULL,
     waterfront = if ("waterfront" %in% names(.)) as.factor(waterfront) else NULL,
@@ -32,44 +39,125 @@ df <- df %>%
     grade = if ("grade" %in% names(.)) as.factor(grade) else NULL
   )
 
-# Create modeling dataset
-drop_cols <- intersect(names(df), c("id", "date"))
-df_model <- dplyr::select(df, -dplyr::all_of(drop_cols))
-
 # We will be using log(price) for final model
-df_model <- df_model %>% mutate(log_price = log(price))
+df <- df %>%
+  mutate(log_price = log(price)) %>%
+  dplyr::select(-price)
+```
 
-stopifnot("price" %in% names(df_model))
+```{r}
+# Check for variables with perfect multicollinearity 
+alias_obj <- alias(lm(log_price ~ ., data = df))
+redundant_cols <- rownames(alias_obj$Complete)
+redundant_cols
+```
+
+```{r}
+# Drop ID, Date + redundant variables from modeling
+drop_cols <- intersect(names(df), c("id", "date", redundant_cols))
+df_model <- dplyr::select(df, -dplyr::all_of(drop_cols))
 ```
 
 ```{r}
 # Train/Test Split
 set.seed(5703)
 idx <- createDataPartition(df_model$log_price, p = 0.80, list = FALSE)
-train <- df_model[idx, , drop = FALSE]
-test  <- df_model[-idx, , drop = FALSE]
+train_df <- df_model[idx, , drop = FALSE]
+test_df <- df_model[-idx, , drop = FALSE]
 
-cat("Train rows:", nrow(train), "\nTest rows:", nrow(test), "\n")
+cat("Train rows:", nrow(train_df), "\nTest rows:", nrow(test_df), "\n")
 ```
 
-Part 1: Model selection methods
+## Part 1: Model selection methods
 
-A. Best Subset Selection
+### A. Best Subset Selection
+
+`zipcode` is not included in best subset selection because it has 70 levels once dummy encoded. This results in too many predictors for `regsubsets` to handle.
+
 ```{r}
-p <- length(setdiff(names(train), c("price","log_price","zipcode")))
+# get the number of predictors after dummy encoding categorical predictors
+p <- ncol(model.matrix(~ . - log_price -zipcode, data=train_df))
 
-best_fit <- regsubsets(log_price ~ . -price - zipcode, data = train, nvmax = p)
+best_fit <- regsubsets(log_price ~ . - zipcode, data = train_df, nvmax = p)
 
 best_summary <-summary(best_fit)
 
-plot(best_summary$adjr2, type="b", main="Adjusted R2")
-plot(best_summary$cp, type="b", main="Cp")
-plot(best_summary$bic, type="b", main="BIC")
+# View metrics
+cat("Regsubsets Metrics\nAdjusted R^2:\n")
+best_summary$adjr2
+cat("\nCP:\n")
+best_summary$cp
+cat("\nBIC:\n")
+best_summary$bic
+
+# Identify optimal model size for each criterion
+best_adjr2 <- which.max(best_summary$adjr2)
+best_cp    <- which.min(best_summary$cp)
+best_bic   <- which.min(best_summary$bic)
+
+cat("\nIndexes of best subset for each metric:\nR^2: ", best_adjr2, "\n")
+cat("Cp: ", best_cp, "\n")
+cat("BIC: ", best_bic, "\n")
 ```
 
-B. Stepwise Selection(Forward, Backward or Both)
 ```{r}
-full_model <- lm(log_price ~ . -price, data = train)
+# Plots
+par(mfrow = c(1,3))
+
+plot(best_summary$adjr2, xlab = "Number of predictors", ylab = "Adjusted R2", type = "b")
+points(best_adjr2, best_summary$adjr2[best_adjr2], col = "red", pch = 19)
+
+plot(best_summary$cp, xlab = "Number of predictors", ylab = "Cp", type = "b")
+points(best_cp, best_summary$cp[best_cp], col = "red", pch = 19)
+
+plot(best_summary$bic, xlab = "Number of predictors", ylab = "BIC", type = "b")
+points(best_bic, best_summary$bic[best_bic], col = "red", pch = 19)
+
+par(mfrow = c(1,1))
+```
+
+Refitting the model using the best BIC subset. We're using the all-or-nothing rule for categorical values. If one of the categorical levels is selected, the whole categorical variable is selected in the final model.
+
+```{r}
+best_bic_coefs <- coef(best_fit, best_bic)
+# Extract predictor names (remove intercept)
+selected_vars <- names(best_bic_coefs)[-1]
+all_original_vars <- colnames(train_df)
+# Selected predictors might be a dummy-coded variable, so we need to map it back to its original variable name.
+final_selection <- all_original_vars[sapply(all_original_vars, function(v) any(grepl(v, selected_vars)))]
+cat("Best variable subset selected by regsubsets:\n")
+selected_vars
+cat("\n\nVariables selected for final model:\n")
+final_selection
+```
+
+```{r}
+# Build formula dynamically
+formula_bss <- as.formula(
+  paste("log_price ~", paste(final_selection, collapse = " + "))
+)
+
+# Refit model using training data
+bss_model <- lm(formula_bss, data = train_df)
+summary(bss_model)
+
+# Predictions on test set
+pred_test <- predict(bss_model, newdata = test_df)
+
+# Test RMSE
+rmse_bss <- sqrt(mean((test_df$log_price - pred_test)^2))
+
+# Test R-squared
+r2_bss <- 1 - sum((test_df$log_price - pred_test)^2) /
+  sum((test_df$log_price - mean(test_df$log_price))^2)
+
+cat("Test set metric of model with best subset selection\n")
+cat("RMSE: ", rmse_bss, "\nR^2: ", r2_bss)
+```
+
+### B. Stepwise Selection(Forward, Backward or Both)
+```{r}
+full_model <- lm(log_price ~ ., data = train_df)
 
 step_model <- step(full_model, direction = "both", trace = FALSE)
 summary(step_model)
@@ -83,16 +171,16 @@ top_vars <- broom::tidy(step_model) %>%
 top_vars
 ```
 
-Part 2: Regularization and 5-fold cross validation
+## Part 2: Regularization and 5-fold cross validation
 
 our outcome is continuous so we will be using ridge and lasso
 ```{r}
 # exclude price and log_price from predictors
-x_train <- model.matrix(log_price ~ . - price - log_price, data = train)[, -1]
-y_train <- train$log_price
+x_train <- model.matrix(log_price ~ . - log_price, data = train_df)[, -1]
+y_train <- train_df$log_price
 
-x_test <- model.matrix(log_price ~ . - price - log_price, data = test)[, -1]
-y_test <- test$log_price
+x_test <- model.matrix(log_price ~ . - log_price, data = test_df)[, -1]
+y_test <- test_df$log_price
 
 # 5-fold CV for Ridge Regression
 set.seed(5703)
@@ -127,5 +215,5 @@ zero_predictors <- rownames(lasso_coef)[lasso_coef[, 1] == 0]
 zero_predictors
 ```
 
-Part 3: Model performance evaluation and final choice 
+## Part 3: Model performance evaluation and final choice 
 In the written report.
