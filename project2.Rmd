@@ -41,8 +41,7 @@ df <- df_raw %>%
 
 # We will be using log(price) for final model
 df <- df %>%
-  mutate(log_price = log(price)) %>%
-  dplyr::select(-price)
+  mutate(log_price = log(price))
 ```
 
 ```{r}
@@ -60,12 +59,51 @@ df_model <- dplyr::select(df, -dplyr::all_of(drop_cols))
 
 ```{r}
 # Train/Test Split
-set.seed(5703)
 idx <- createDataPartition(df_model$log_price, p = 0.80, list = FALSE)
 train_df <- df_model[idx, , drop = FALSE]
 test_df <- df_model[-idx, , drop = FALSE]
 
 cat("Train rows:", nrow(train_df), "\nTest rows:", nrow(test_df), "\n")
+```
+
+**Target encoding for zipcode using training data only**
+
+This avoids data leakage. We compute the median of log_price for each `zipcode` using only the training set, then join those values to both training and test data.
+
+The test set should use `zipcode` medians learned from the training data, not medians computed from the test set.
+```{r}
+zip_medians <- train_df |>
+  group_by(zipcode) |>
+  summarize(zipcode_log_median = median(log_price), .groups = "drop")
+
+train_df <- train_df |>
+  left_join(zip_medians, by = "zipcode")
+
+test_df <- test_df |>
+  left_join(zip_medians, by = "zipcode")
+
+# Fallback in case a zipcode appears only in the test set
+overall_train_log_median <- median(train_df$log_price)
+
+test_df <- test_df |>
+  mutate(
+    zipcode_log_median = if_else(
+      is.na(zipcode_log_median),
+      overall_train_log_median,
+      zipcode_log_median
+    )
+  )
+
+summary(train_df$zipcode_log_median)
+summary(test_df$zipcode_log_median)
+```
+
+```{r}
+train_df <- train_df |>
+   dplyr::select(-zipcode)
+
+test_df <- test_df |>
+   dplyr::select(-zipcode)
 ```
 
 ## Part 1: Model selection methods
@@ -76,9 +114,9 @@ cat("Train rows:", nrow(train_df), "\nTest rows:", nrow(test_df), "\n")
 
 ```{r}
 # get the number of predictors after dummy encoding categorical predictors
-p <- ncol(model.matrix(~ . - log_price -zipcode, data=train_df))
+p <- ncol(model.matrix(~ . - log_price -price, data=train_df))
 
-best_fit <- regsubsets(log_price ~ . - zipcode, data = train_df, nvmax = p)
+best_fit <- regsubsets(log_price ~ . - price, data = train_df, nvmax = p)
 
 best_summary <-summary(best_fit)
 
@@ -141,23 +179,32 @@ formula_bss <- as.formula(
 bss_model <- lm(formula_bss, data = train_df)
 summary(bss_model)
 
+```
+
+```{r}
 # Predictions on test set
-pred_test <- predict(bss_model, newdata = test_df)
+print_performance_metrics <- function (pred_log_test, test_df){
+  pred_test <- exp(pred_log_test)
+  
+  # Test RMSE
+  rmse_bss <- sqrt(mean((test_df$price - pred_test)^2))
+  
+  # Test R-squared
+  r2_bss <- 1 - sum((test_df$price - pred_test)^2) /
+    sum((test_df$price - mean(test_df$price))^2)
+  
+  cat("RMSE: ", rmse_bss, "\nR^2: ", r2_bss)
+}
 
-# Test RMSE
-rmse_bss <- sqrt(mean((test_df$log_price - pred_test)^2))
 
-# Test R-squared
-r2_bss <- 1 - sum((test_df$log_price - pred_test)^2) /
-  sum((test_df$log_price - mean(test_df$log_price))^2)
-
+pred_log_test <- predict(bss_model, newdata = test_df)
 cat("Test set metric of model with best subset selection\n")
-cat("RMSE: ", rmse_bss, "\nR^2: ", r2_bss)
+print_performance_metrics(pred_log_test, test_df)
 ```
 
 ### B. Stepwise Selection(Forward, Backward or Both)
 ```{r}
-full_model <- lm(log_price ~ ., data = train_df)
+full_model <- lm(log_price ~ . -price , data = train_df)
 
 step_model <- step(full_model, direction = "both", trace = FALSE)
 summary(step_model)
@@ -171,19 +218,26 @@ top_vars <- broom::tidy(step_model) %>%
 top_vars
 ```
 
+
+```{r}
+# Predictions on test set
+cat("Test set metric of model with stepwise selection\n")
+pred_log_test <- predict(step_model, newdata = test_df)
+print_performance_metrics(pred_log_test, test_df)
+```
+
 ## Part 2: Regularization and 5-fold cross validation
 
 our outcome is continuous so we will be using ridge and lasso
 ```{r}
 # exclude price and log_price from predictors
-x_train <- model.matrix(log_price ~ . - log_price, data = train_df)[, -1]
+x_train <- model.matrix(log_price ~ . - log_price -price, data = train_df)[, -1]
 y_train <- train_df$log_price
 
-x_test <- model.matrix(log_price ~ . - log_price, data = test_df)[, -1]
+x_test <- model.matrix(log_price ~ . - log_price -price, data = test_df)[, -1]
 y_test <- test_df$log_price
 
 # 5-fold CV for Ridge Regression
-set.seed(5703)
 cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0, nfolds = 5)
 plot(cv_ridge)
 title("Ridge Regression CV Error Curve")
@@ -197,7 +251,6 @@ coef(cv_ridge, s = "lambda.min")
 
 
 # 5-fold CV for LASSO Regression
-set.seed(5703)
 cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 5)
 plot(cv_lasso)
 title("LASSO Regression CV Error Curve")
@@ -213,6 +266,16 @@ lasso_coef
 # Which predictors are zero
 zero_predictors <- rownames(lasso_coef)[lasso_coef[, 1] == 0]
 zero_predictors
+```
+
+```{r}
+cat("Test set metric of model with ridge lambda.min\n")
+pred_log_ridge <- predict(cv_ridge, s = "lambda.min", newx = x_test)
+print_performance_metrics(pred_log_ridge, test_df)
+
+cat("\n\nTest set metric of model with lasso lambda.min\n")
+pred_log_ridge <- predict(cv_lasso, s = "lambda.min", newx = x_test)
+print_performance_metrics(pred_log_ridge, test_df)
 ```
 
 ## Part 3: Model performance evaluation and final choice 
