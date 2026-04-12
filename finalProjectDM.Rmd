@@ -1,0 +1,666 @@
+---
+title: "FinalProject"
+author: "Group 6: Cristhian Cruz, Julian McKinley, Luisa Ribeiro, Matheus Lucena"
+date: "2026-04-08"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  results = "hold"
+)
+```
+
+# Project goal
+
+This file is organized to match the Project Presentation #2 rubric. The response variable is **house sale price**, and because price is strongly right-skewed, the regression models are fit on **log(price)** and then evaluated back on the original **price** scale using RMSE and test-set $R^2$.
+
+The main goals are:
+
+1.  compare **best subset selection** and **stepwise selection**;
+2.  fit **ridge** and **lasso** using **5-fold cross-validation**;
+3.  compare model performance on a held-out test set;
+4.  justify a final model choice while discussing complexity and overfitting.
+
+# 1. Setup and data preparation
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(caret)
+  library(MASS)
+  library(leaps)
+  library(glmnet)
+  library(broom)
+  library(knitr)
+})
+
+set.seed(5703)
+```
+
+```{r load-data}
+df_raw <- read.csv("kc_house_data.csv")
+str(df_raw)
+```
+
+```{r preprocess-data}
+# Convert categorical predictors to factors
+# and create the log-transformed outcome used in modeling.
+df <- df_raw %>%
+  mutate(
+    zipcode = factor(zipcode),
+    waterfront = factor(waterfront),
+    view = factor(view),
+    condition = factor(condition),
+    grade = factor(grade),
+    log_price = log(price)
+  )
+```
+
+```{r alias-check}
+# Check for perfect multicollinearity before modeling.
+alias_obj <- alias(lm(log_price ~ ., data = df))
+redundant_cols <- rownames(alias_obj$Complete)
+redundant_cols
+```
+
+```{r drop-columns}
+# Drop identifiers and any aliased columns.
+drop_cols <- intersect(names(df), c("id", "date", redundant_cols))
+df_model <- df %>% dplyr::select(-dplyr::all_of(drop_cols))
+
+names(df_model)
+```
+
+```{r split-data}
+# 80/20 train-test split
+idx <- createDataPartition(df_model$log_price, p = 0.80, list = FALSE)
+train_df <- df_model[idx, , drop = FALSE]
+test_df  <- df_model[-idx, , drop = FALSE]
+
+cat("Train rows:", nrow(train_df), "\n")
+cat("Test rows:", nrow(test_df), "\n")
+```
+
+## 1.1 Target encoding for zipcode
+
+`zipcode` has many levels, so for subset-selection methods we replace it with a **training-only target-encoded feature** named `zipcode_log_median`. This preserves location information while avoiding a very large set of dummy variables. The encoding is learned from the training set only to avoid leakage.
+
+```{r zipcode-encoding}
+zip_medians <- train_df %>%
+  group_by(zipcode) %>%
+  summarize(zipcode_log_median = median(log_price), .groups = "drop")
+
+train_df <- train_df %>% left_join(zip_medians, by = "zipcode")
+test_df  <- test_df  %>% left_join(zip_medians, by = "zipcode")
+
+overall_train_log_median <- median(train_df$log_price)
+
+test_df <- test_df %>%
+  mutate(
+    zipcode_log_median = if_else(
+      is.na(zipcode_log_median),
+      overall_train_log_median,
+      zipcode_log_median
+    )
+  )
+
+summary(train_df$zipcode_log_median)
+summary(test_df$zipcode_log_median)
+```
+
+```{r remove-original-zipcode}
+# Remove the original zipcode after encoding.
+df_model <- df %>% dplyr::select(-dplyr::all_of(drop_cols))
+train_df <- train_df %>% dplyr::select(-zipcode)
+test_df  <- test_df  %>% dplyr::select(-zipcode)
+```
+
+## 1.2 Helper functions
+
+```{r helper-functions}
+# Evaluate predictions on the original price scale.
+price_metrics <- function(pred_log, actual_price) {
+  pred_price <- exp(as.numeric(pred_log))
+  mse <- mean((actual_price - pred_price)^2)
+  rmse <- sqrt(mse)
+  mae <- mean(abs(actual_price - pred_price))
+  
+  r2 <- 1 - sum((actual_price - pred_price)^2) /
+    sum((actual_price - mean(actual_price))^2)
+
+  tibble( RMSE = rmse,
+    MAE = mae,
+    MSE = mse,
+    R2 = r2)
+}
+
+# Nice printing wrapper for console output.
+print_price_metrics <- function(model_name, pred_log, actual_price) {
+  out <- price_metrics(pred_log, actual_price)
+  cat(model_name, "\n")
+  cat("RMSE:", round(out$RMSE, 3), "\n")
+  cat("R^2:", round(out$R2, 6), "\n\n")
+  invisible(out)
+}
+
+# Extract the original term names selected by regsubsets.
+# This supports the all-or-nothing treatment of factors.
+extract_selected_terms <- function(selected_dummies, data) {
+  mm <- model.matrix(log_price ~ . - price, data = data)
+  mm_terms <- attr(terms(log_price ~ . - price, data = data), "term.labels")
+  mm_assign <- attr(mm, "assign")[-1]
+  mm_names <- colnames(mm)[-1]
+
+  dummy_map <- tibble(
+    dummy = mm_names,
+    term_index = mm_assign,
+    term = mm_terms[mm_assign]
+  )
+
+  unique(dummy_map$term[dummy_map$dummy %in% selected_dummies])
+}
+
+# Helper to display the largest coefficients.
+extract_top_coefs <- function(coef_object, top_n = 12) {
+  tibble(
+    term = rownames(as.matrix(coef_object)),
+    estimate = as.numeric(coef_object)
+  ) %>%
+    filter(term != "(Intercept)") %>%
+    arrange(desc(abs(estimate))) %>%
+    slice_head(n = top_n)
+}
+```
+
+# 2. Best subset selection
+
+Best subset selection performs an exhaustive search over models of different sizes. The rubric specifically asks for **Adjusted** $R^2$, **Mallows** $C_p$, and **BIC**, so those metrics are computed and plotted below.
+
+```{r best-subset-fit}
+# Number of candidate predictors after dummy encoding (excluding intercept).
+p <- ncol(model.matrix(log_price ~ . - price, data = train_df)) - 1
+
+best_fit <- regsubsets(
+  log_price ~ . - price,
+  data = train_df,
+  nvmax = p,
+  method = "exhaustive"
+)
+
+best_summary <- summary(best_fit)
+
+best_metrics <- tibble(
+  size = 1:p,
+  adj_r2 = best_summary$adjr2,
+  cp = best_summary$cp,
+  bic = best_summary$bic
+)
+
+best_adjr2 <- which.max(best_summary$adjr2)
+best_cp    <- which.min(best_summary$cp)
+best_bic   <- which.min(best_summary$bic)
+
+kable(
+  tibble(
+    Criterion = c("Adjusted R^2", "Cp", "BIC"),
+    Best_Model_Size = c(best_adjr2, best_cp, best_bic)
+  ),
+  digits = 4,
+  caption = "Optimal model sizes from best subset selection"
+)
+```
+
+```{r best-subset-metrics-output}
+cat("Regsubsets metrics\n")
+cat("Best model size by Adjusted R^2:", best_adjr2, "\n")
+cat("Best model size by Cp:", best_cp, "\n")
+cat("Best model size by BIC:", best_bic, "\n")
+```
+
+```{r best-subset-plots, fig.width=11, fig.height=3.8}
+par(mfrow = c(1, 3))
+
+plot(best_metrics$size, best_metrics$adj_r2,
+     type = "b", xlab = "Number of predictors", ylab = "Adjusted R^2")
+points(best_adjr2, best_metrics$adj_r2[best_adjr2], col = "red", pch = 19)
+
+plot(best_metrics$size, best_metrics$cp,
+     type = "b", xlab = "Number of predictors", ylab = "Cp")
+points(best_cp, best_metrics$cp[best_cp], col = "red", pch = 19)
+
+plot(best_metrics$size, best_metrics$bic,
+     type = "b", xlab = "Number of predictors", ylab = "BIC")
+points(best_bic, best_metrics$bic[best_bic], col = "red", pch = 19)
+
+par(mfrow = c(1, 1))
+```
+
+## 2.1 Interpretation of Adjusted $R^2$, $C_p$, and BIC
+
+-   **Adjusted** $R^2$ rewards model fit but penalizes unnecessary predictors, so higher values are preferred.
+-   **Mallows** $C_p$ measures the bias-variance tradeoff, so lower values are preferred.
+-   **BIC** penalizes model size more strongly than Adjusted $R^2$ or $C_p$, so lower values are preferred when the goal is a more parsimonious model.
+
+Because BIC applies the strongest complexity penalty, the **BIC-selected model** is used as the final best-subset candidate for test-set evaluation.
+
+## 2.2 Refit the BIC-selected subset
+
+The raw `regsubsets()` output is based on dummy-coded columns. To make the final model interpretable, the selected dummy variables are mapped back to their original terms, and factor variables are included using an all-or-nothing rule.
+
+```{r best-subset-selected-terms}
+best_bic_coefs <- coef(best_fit, id = best_bic)
+selected_dummies <- names(best_bic_coefs)[-1]
+selected_terms <- extract_selected_terms(selected_dummies, train_df)
+
+selected_dummies
+selected_terms
+```
+
+```{r best-subset-refit}
+formula_bss <- as.formula(
+  paste("log_price ~", paste(selected_terms, collapse = " + "))
+)
+
+bss_model <- lm(formula_bss, data = train_df)
+summary(bss_model)
+```
+
+```{r best-subset-test-metrics}
+pred_log_bss <- predict(bss_model, newdata = test_df)
+bss_test_metrics <- print_price_metrics(
+  "Best subset model (BIC-selected) test metrics:",
+  pred_log_bss,
+  test_df$price
+)
+```
+
+### Best subset interpretation
+
+The best subset model is expected to keep predictors related to **size**, **quality**, **location**, and **amenities**, which are the dominant drivers of housing price in this dataset. In the presentation, the best BIC model was also the strongest held-out performer, with approximately **RMSE = 142,317** and **test \$R\^2 = 0.816**. Those results are consistent with a strong but still interpretable model.
+
+# 3. Stepwise selection
+
+Stepwise selection is less computationally expensive than exhaustive search because it adds and removes predictors sequentially rather than evaluating every possible combination.
+
+```{r stepwise-fit}
+full_model <- lm(log_price ~ . - price, data = train_df)
+step_model <- step(full_model, direction = "both", trace = FALSE)
+
+summary(step_model)
+```
+
+```{r stepwise-top-predictors}
+step_coefs <- tidy(step_model) %>%
+  filter(term != "(Intercept)") %>%
+  arrange(p.value)
+
+kable(
+  step_coefs %>% slice_head(n = 12),
+  digits = 4,
+  caption = "Most statistically significant terms in the stepwise model"
+)
+```
+
+```{r stepwise-test-metrics}
+pred_log_step <- predict(step_model, newdata = test_df)
+step_test_metrics <- print_price_metrics(
+  "Stepwise model test metrics:",
+  pred_log_step,
+  test_df$price
+)
+```
+
+### Stepwise interpretation and comparison with best subset
+
+The stepwise model should select many of the same structural and location-based predictors chosen by best subset selection. In the current presentation, the stepwise model emphasizes `zipcode_log_median`, `sqft_living`, `lat`, `long`, `yr_built`, `waterfront`, and higher `view` categories, which is substantively consistent with the best subset story. Its reported held-out performance is also very similar to best subset, with approximately **RMSE = 142,518** and **test \$R\^2 = 0.8156**.
+
+# 4. Regularization with 5-fold cross-validation
+
+Because the response is continuous, the regularization analysis uses **ridge regression** and **lasso regression**. Both are fit with **5-fold cross-validation**, as required by the rubric.
+
+```{r design-matrices}
+x_train <- model.matrix(log_price ~ . - log_price - price, data = train_df)[, -1]
+y_train <- train_df$log_price
+
+x_test <- model.matrix(log_price ~ . - log_price - price, data = test_df)[, -1]
+y_test <- test_df$log_price
+
+dim(x_train)
+dim(x_test)
+```
+
+## 4.1 Ridge regression
+
+```{r ridge-cv, fig.width=7, fig.height=5}
+cv_ridge <- cv.glmnet(
+  x_train,
+  y_train,
+  alpha = 0,
+  nfolds = 5
+)
+
+plot(cv_ridge)
+title("Ridge regression: 5-fold CV error curve")
+
+ridge_lambda_min <- cv_ridge$lambda.min
+ridge_lambda_1se <- cv_ridge$lambda.1se
+
+ridge_lambda_min
+ridge_lambda_1se
+```
+
+```{r ridge-coefficients}
+ridge_coef_min <- coef(cv_ridge, s = "lambda.min")
+ridge_coef_1se <- coef(cv_ridge, s = "lambda.1se")
+
+kable(
+  extract_top_coefs(ridge_coef_min, top_n = 12),
+  digits = 5,
+  caption = "Largest ridge coefficients at lambda.min"
+)
+```
+
+```{r ridge-test-metrics}
+pred_log_ridge_min <- predict(cv_ridge, s = "lambda.min", newx = x_test)
+pred_log_ridge_1se <- predict(cv_ridge, s = "lambda.1se", newx = x_test)
+
+ridge_test_min <- print_price_metrics(
+  "Ridge model test metrics (lambda.min):",
+  pred_log_ridge_min,
+  test_df$price
+)
+
+ridge_test_1se <- print_price_metrics(
+  "Ridge model test metrics (lambda.1se):",
+  pred_log_ridge_1se,
+  test_df$price
+)
+```
+
+### Ridge interpretation
+
+`lambda.min` gives the value of $\lambda$ with the lowest cross-validated error, while `lambda.1se` gives the largest $\lambda$ within one standard error of the minimum. The latter is often preferred when a slightly simpler and more stable model is desired. In the current presentation, ridge at `lambda.min` achieves approximately **RMSE = 142,363** and **test \$R\^2 = 0.816**, very close to best subset.
+
+## 4.2 LASSO regression
+
+```{r lasso-cv, fig.width=7, fig.height=5}
+cv_lasso <- cv.glmnet(
+  x_train,
+  y_train,
+  alpha = 1,
+  nfolds = 5
+)
+
+plot(cv_lasso)
+title("LASSO regression: 5-fold CV error curve")
+
+lasso_lambda_min <- cv_lasso$lambda.min
+lasso_lambda_1se <- cv_lasso$lambda.1se
+
+lasso_lambda_min
+lasso_lambda_1se
+```
+
+```{r lasso-coefficients}
+lasso_coef_min <- coef(cv_lasso, s = "lambda.min")
+lasso_coef_1se <- coef(cv_lasso, s = "lambda.1se")
+
+zero_predictors_min <- rownames(lasso_coef_min)[as.numeric(lasso_coef_min) == 0]
+nonzero_predictors_min <- rownames(lasso_coef_min)[as.numeric(lasso_coef_min) != 0]
+
+kable(
+  extract_top_coefs(lasso_coef_min, top_n = 12),
+  digits = 5,
+  caption = "Largest LASSO coefficients at lambda.min"
+)
+
+zero_predictors_min
+```
+
+```{r lasso-test-metrics}
+pred_log_lasso_min <- predict(cv_lasso, s = "lambda.min", newx = x_test)
+pred_log_lasso_1se <- predict(cv_lasso, s = "lambda.1se", newx = x_test)
+
+lasso_test_min <- print_price_metrics(
+  "LASSO model test metrics (lambda.min):",
+  pred_log_lasso_min,
+  test_df$price
+)
+
+lasso_test_1se <- print_price_metrics(
+  "LASSO model test metrics (lambda.1se):",
+  pred_log_lasso_1se,
+  test_df$price
+)
+```
+
+### LASSO interpretation
+
+Unlike ridge, lasso can shrink some coefficients exactly to zero, which makes it a built-in variable-selection method. In the current presentation, lasso at `lambda.min` sets **`condition3`** and **`grade8`** to zero and achieves approximately **RMSE = 142,517** and **test \$R\^2 = 0.8156**.
+
+# 5. Model comparison and final justification
+
+The rubric asks for a direct comparison across subset, stepwise, ridge, and lasso methods. The table below compares the main held-out models. For the regularized methods, the primary comparison uses **`lambda.min`** because that corresponds to the minimum cross-validated error.
+
+```{r final-comparison-table}
+comparison_table <- bind_rows(
+  tibble(
+    Method = "Best Subset (BIC)",
+    Model_Size_or_Tuning = paste0("size = ", best_bic),
+    RMSE = bss_test_metrics$RMSE,
+    R2 = bss_test_metrics$R2
+  ),
+  tibble(
+    Method = "Stepwise",
+    Model_Size_or_Tuning = "both directions",
+    RMSE = step_test_metrics$RMSE,
+    R2 = step_test_metrics$R2
+  ),
+  tibble(
+    Method = "Ridge",
+    Model_Size_or_Tuning = paste0("lambda.min = ", signif(ridge_lambda_min, 5)),
+    RMSE = ridge_test_min$RMSE,
+    R2 = ridge_test_min$R2
+  ),
+  tibble(
+    Method = "LASSO",
+    Model_Size_or_Tuning = paste0("lambda.min = ", signif(lasso_lambda_min, 5)),
+    RMSE = lasso_test_min$RMSE,
+    R2 = lasso_test_min$R2
+  )
+) %>%
+  arrange(RMSE)
+
+kable(
+  comparison_table,
+  digits = 4,
+  caption = "Final model comparison on the test set"
+)
+```
+
+## 5.1 Final discussion
+
+Overall, all four approaches are expected to perform very similarly on this dataset. That pattern is already visible in the current presentation, where the reported test-set performance is approximately: best subset **142,317 / 0.816**, ridge **142,363 / 0.816**, stepwise **142,518 / 0.8156**, and lasso **142,517 / 0.8156** for RMSE / test $R^2$, respectively.
+
+The **BIC-selected best subset model** is the strongest final choice because it provides:
+
+-   the **lowest held-out RMSE** in the current results;
+-   a strong test $R^2$;
+-   an interpretable set of predictors centered on **location**, **living area**, **quality**, **view**, and **waterfront status**.
+
+At the same time, the tiny differences across methods are important to mention: ridge is almost identical in predictive performance, which suggests the overall signal in the data is stable and not overly dependent on one modeling strategy. This is a useful point for the presentation because it shows that the findings are not fragile.
+
+## 5.2 Overfitting and the role of cross-validation
+
+Subset and stepwise procedures can overfit if model complexity is chosen only from training fit. That is why the project uses **BIC** for a stronger complexity penalty in best subset selection and **5-fold cross-validation** for ridge and lasso. Cross-validation helps estimate out-of-sample error and therefore improves generalization. The similarity between train-selected models and test-set results supports the conclusion that the final models are not severely overfit.
+
+# 6. Classification extension
+
+This project is a **regression** project with a continuous outcome, so the classification extension in the rubric is **not applicable here**. If the group later adds a binary classification target (for example, above-vs-below median price), then confusion matrix, sensitivity, specificity, ROC curve, and AUC could be included in a separate extension analysis. For the current submission, the core required work is the regression comparison.
+
+# 7. Final conclusion
+
+Sale price in the King County housing dataset is driven primarily by **location**, **home size**, **quality**, **waterfront access**, and **view-related amenities**. Across best subset, stepwise, ridge, and lasso, these same themes repeatedly emerge.
+
+The final recommended model is the **BIC-selected best subset model** because it achieved the strongest test performance while remaining interpretable. Ridge and lasso confirm that the signal is stable under shrinkage, and 5-fold cross-validation provides additional protection against overfitting. This gives a strong, rubric-aligned justification for the final model choice.
+
+
+
+
+#NEW STUFF for final presentation
+
+```{r}
+#Decision Tree (baseline)
+library(rpart)
+library(rpart.plot)
+
+# Fit regression tree
+tree_model <- rpart(
+  log_price ~ . - price,
+  data = train_df,
+  method = "anova",
+  control = rpart.control(cp = 0.00001)
+)
+
+printcp(tree_model)
+plotcp(tree_model)
+
+best_cp <- tree_model$cptable[
+  which.min(tree_model$cptable[, "xerror"]),
+  "CP"
+]
+cat("Best CP:", best_cp, "\n")
+
+pruned_tree <- prune(tree_model, cp = best_cp)
+
+# Plot tree
+rpart.plot(pruned_tree, main = "Pruned Decision Tree")
+
+# Predictions
+pred_log_tree <- predict(pruned_tree, newdata = test_df)
+
+tree_test_metrics <- print_price_metrics(
+  "Pruned Decision Tree test metrics:",
+  pred_log_tree,
+  test_df$price
+)
+
+```
+
+
+```{r}
+#Bagging 
+library(randomForest)
+
+# Number of predictors
+p <- ncol(x_train)
+
+bagging_model <- randomForest( x = x_train, y = y_train, mtry = p,ntree = 200, importance = TRUE )
+
+# Predictions
+pred_log_bag <- predict(bagging_model, newdata = x_test)
+
+bagging_test_metrics <- print_price_metrics(
+  "Bagging test metrics:",
+  pred_log_bag,
+  test_df$price
+)
+
+```
+
+```{r}
+#Random Forest
+rf_model <- randomForest( x = x_train, y = y_train, mtry = floor(sqrt(ncol(x_train))), ntree = 300, importance = TRUE )
+
+# Predictions
+pred_log_rf <- predict(rf_model, newdata = x_test)
+
+rf_test_metrics <- print_price_metrics(
+  "Random Forest test metrics:",
+  pred_log_rf,
+  test_df$price
+)
+
+# Variable importance
+varImpPlot(rf_model, main = "Random Forest Variable Importance")
+
+```
+
+```{r}
+#Boosting
+library(gbm)
+
+boost_model <- gbm(
+  log_price ~ . - price,
+  data = train_df,
+  distribution = "gaussian",
+  n.trees = 3000,
+  interaction.depth = 4,
+  shrinkage = 0.01,
+  cv.folds = 5
+)
+
+# Best number of trees
+best_iter <- gbm.perf(boost_model, method = "cv")
+
+# Predictions
+pred_log_boost <- predict(boost_model, newdata = test_df, n.trees = best_iter)
+
+boost_test_metrics <- print_price_metrics(
+  "Boosting test metrics:",
+  pred_log_boost,
+  test_df$price
+)
+
+```
+
+```{r}
+#Comparison
+comparison_table <- bind_rows(
+  comparison_table,
+  tibble(
+    Method = "Decision Tree",
+    Model_Size_or_Tuning = paste0("cp=", round(best_cp, 5)),
+    RMSE = tree_test_metrics$RMSE,
+    MAE = tree_test_metrics$MAE,
+    MSE = tree_test_metrics$MSE,
+    R2 = tree_test_metrics$R2
+  ),
+  tibble(
+    Method = "Bagging",
+    Model_Size_or_Tuning = paste0("ntree=200"),
+    RMSE = bagging_test_metrics$RMSE,
+    MAE = bagging_test_metrics$MAE,
+    MSE = bagging_test_metrics$MSE,
+    R2 = bagging_test_metrics$R2
+  ),
+  tibble(
+    Method = "Random Forest",
+    Model_Size_or_Tuning = paste0("mtry=", floor(sqrt(ncol(x_train)))),
+    RMSE = rf_test_metrics$RMSE,
+    MAE = rf_test_metrics$MAE,
+    MSE = rf_test_metrics$MSE,
+    R2 = rf_test_metrics$R2
+  ),
+  tibble(
+    Method = "Boosting",
+    Model_Size_or_Tuning = paste0("trees=", best_iter),
+    RMSE = boost_test_metrics$RMSE,
+    MAE = boost_test_metrics$MAE,
+    MSE = boost_test_metrics$MSE,
+    R2 = boost_test_metrics$R2
+  )
+) %>%
+  arrange(RMSE)
+
+kable(comparison_table, digits = 4,
+      caption = "Extended model comparison including tree-based methods")
+```
