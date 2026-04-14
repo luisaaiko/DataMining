@@ -1,0 +1,543 @@
+---
+title: "Final Project Step 3: Ensemble Tree Methods for House Price Prediction"
+author: "Group 6: Cristhian Cruz, Julian McKinley, Luisa Ribeiro, Matheus Lucena"
+date: "2026-04-13"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  results = "hold"
+)
+```
+
+# Problem Statement
+The goal of this project is to predict house sale price using housing characteristics from the King County housing dataset. This is a regression problem, since the response variable is continuous.
+This problem matters because accurate house price prediction is useful in real estate valuation, pricing strategy, and market analysis. In this final step of the project, we focus on ensemble tree methods from Chapter 8 
+and compare:
+
+Bagging
+Random Forest
+Boosting
+
+A single regression tree is also included as a benchmark, but the main emphasis is on the three required ensemble methods.
+
+# Packages
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(caret)
+  library(rpart)
+  library(rpart.plot)
+  library(gbm)
+  library(knitr)
+  library(ranger)
+  library(parallel)
+})
+
+N_CORES <- max(1, detectCores() - 1)   # leave 1 core free
+```
+
+```{r}
+N_CORES
+```
+
+# Helper Functions
+```{r}
+set.seed(5703)
+
+price_metrics <- function(pred_log, actual_price) {
+  pred_price <- exp(as.numeric(pred_log))
+  mse <- mean((actual_price - pred_price)^2)
+  rmse <- sqrt(mse)
+  mae <- mean(abs(actual_price - pred_price))
+  r2 <- 1 - sum((actual_price - pred_price)^2) /
+    sum((actual_price - mean(actual_price))^2)
+  
+  tibble(
+    RMSE = rmse,
+    MAE = mae,
+    MSE = mse,
+    R2 = r2
+  )
+}
+
+print_price_metrics <- function(model_name, pred_log, actual_price) {
+  out <- price_metrics(pred_log, actual_price)
+  cat(model_name, "\n")
+  cat("RMSE:", round(out$RMSE, 3), "\n")
+  cat("MAE :", round(out$MAE, 3), "\n")
+  cat("MSE :", round(out$MSE, 3), "\n")
+  cat("R^2 :", round(out$R2, 6), "\n\n")
+  invisible(out)
+}
+
+extract_oob_mse <- function(rf_fit) {
+  rf_fit$prediction.error
+}
+
+extract_oob_rsq <- function(rf_fit) {
+  rf_fit$r.squared
+}
+```
+
+# Data Description and Loading
+The dataset used is kc_house_data.csv. The response variable is price. Because house prices are strongly right-skewed, we model log(price) and then transform predictions back to the original price scale for evaluation.
+```{r}
+df_raw <- read.csv("data/kc_house_data.csv")
+str(df_raw)
+summary(df_raw$price)
+```
+
+# Data Cleaning and Preprocessing
+We convert appropriate variables to factors, create a log-transformed response, and remove identifier-type fields that are not useful as predictors.
+```{r}
+df <- df_raw %>%
+  mutate(
+    # Convert to proper datetime
+    date = as.POSIXct(date, format = "%Y%m%dT%H%M%S"),
+    
+    # Extract useful features
+    sale_year  = as.numeric(format(date, "%Y")),
+    sale_month = as.numeric(format(date, "%m")),
+    sale_day   = as.numeric(format(date, "%d")),
+    sale_dow   = as.numeric(format(date, "%u")),  # day of week (1–7)
+    
+    # Optional: continuous time feature
+    sale_time_numeric = as.numeric(date),
+    
+    # Existing transformations
+    zipcode = factor(zipcode),
+    waterfront = factor(waterfront),
+    view = factor(view),
+    condition = factor(condition),
+    grade = factor(grade),
+    log_price = log(price)
+  )
+
+# Drop identifier / raw date fields if present
+drop_cols <- intersect(names(df), c("id", "date"))
+df_model <- df %>% select(-all_of(drop_cols))
+
+glimpse(df_model)
+```
+
+# Train/Test Split
+We use an 80/20 train/test split. All models are trained on the same training set and evaluated on the same test set for a fair comparison.
+```{r}
+set.seed(5703)
+idx <- createDataPartition(df_model$log_price, p = 0.80, list = FALSE)
+
+train_df <- df_model[idx, , drop = FALSE]
+test_df  <- df_model[-idx, , drop = FALSE]
+
+cat("Training rows:", nrow(train_df), "\n")
+cat("Test rows:", nrow(test_df), "\n")
+
+# Encode zipcode using training data only
+zip_medians <- train_df %>%
+  group_by(zipcode) %>%
+  summarize(zipcode_log_median = median(log_price), .groups = "drop")
+
+train_df <- train_df %>%
+  left_join(zip_medians, by = "zipcode")
+
+test_df <- test_df %>%
+  left_join(zip_medians, by = "zipcode")
+
+overall_train_log_median <- median(train_df$log_price)
+
+test_df <- test_df %>%
+  mutate(
+    zipcode_log_median = if_else(
+      is.na(zipcode_log_median),
+      overall_train_log_median,
+      zipcode_log_median
+    )
+  )
+
+# Remove original zipcode after encoding
+train_df <- train_df %>% select(-zipcode)
+test_df  <- test_df %>% select(-zipcode)
+
+glimpse(train_df)
+glimpse(test_df)
+```
+
+# Model Matrices for Bagging and Random Forest
+For ranger(), we create predictor matrices and response vectors. We exclude both price and log_price from predictors, and use log_price as the response.
+```{r}
+x_train <- train_df %>% select(-price, -log_price)
+x_test  <- test_df %>% select(-price, -log_price)
+
+y_train <- train_df$log_price
+y_test  <- test_df$log_price
+
+p <- ncol(x_train)
+
+cat("Number of predictors used:", p, "\n")
+```
+
+# Baseline Model: Single Regression Tree
+A single regression tree is included only as a benchmark. It is not one of the required ensemble methods, but it helps show whether the ensembles improve predictive performance.
+```{r}
+tree_model <- rpart(
+  log_price ~ . - price,
+  data = train_df,
+  method = "anova",
+  control = rpart.control(cp = 0.0001)
+)
+
+printcp(tree_model)
+plotcp(tree_model)
+
+best_cp <- tree_model$cptable[
+  which.min(tree_model$cptable[, "xerror"]),
+  "CP"
+]
+
+cat("Best cp selected from cross-validation table:", best_cp, "\n")
+
+pruned_tree <- prune(tree_model, cp = best_cp)
+
+rpart.plot(pruned_tree, main = "Pruned Regression Tree")
+
+pred_log_tree <- predict(pruned_tree, newdata = test_df)
+
+tree_test_metrics <- print_price_metrics(
+  "Decision Tree Test Metrics:",
+  pred_log_tree,
+  test_df$price
+)
+```
+
+# Bagging
+Bagging fits many trees using bootstrap samples and averages the predictions. For bagging, the number of variables tried at each split is set equal to the total number of predictors, so mtry = p.
+```{r}
+set.seed(5703)
+
+bag_ntree_grid <- c(300, 500, 1000)
+
+bagging_tuning_results <- map_dfr(bag_ntree_grid, function(nt) {
+  fit <- ranger(
+    x = x_train,
+    y = y_train,
+    mtry = p,
+    num.trees = nt,
+    importance = "impurity"
+  )
+  
+  tibble(
+    ntree = nt,
+    mtry = p,
+    OOB_MSE = extract_oob_mse(fit),
+    OOB_R2 = extract_oob_rsq(fit)
+  )
+})
+
+kable(
+  bagging_tuning_results,
+  digits = 5,
+  caption = "Bagging tuning results based on out-of-bag error"
+)
+
+best_bag_ntree <- bagging_tuning_results %>%
+  arrange(OOB_MSE) %>%
+  slice(1) %>%
+  pull(ntree)
+
+cat("Best ntree for bagging:", best_bag_ntree, "\n")
+
+bagging_model <- ranger(
+  x = x_train,
+  y = y_train,
+  mtry = p,
+  num.trees = best_bag_ntree,
+  importance = "impurity"
+)
+
+bagging_model
+bag_importance_values <- sort(importance(bagging_model), decreasing = TRUE)
+barplot(
+  head(bag_importance_values, 15),
+  las = 2,
+  cex.names = 0.7,
+  main = "Top 15 Bagging Variable Importance",
+  ylab = "Importance"
+)
+
+pred_log_bag <- predict(bagging_model, data = x_test)$predictions
+
+bagging_test_metrics <- print_price_metrics(
+  "Bagging Test Metrics:",
+  pred_log_bag,
+  test_df$price
+)
+```
+
+# Random Forest
+Random forest improves on bagging by considering a random subset of predictors at each split. Instead of a very small tuning grid, we tune both mtry and ntree using out-of-bag performance and then fit the final model with the best settings.
+```{r}
+set.seed(5703)
+
+rf_mtry_grid <- unique(c(
+  2,
+  max(2, floor(sqrt(p))),
+  max(2, floor(p / 4)),
+  max(2, floor(p / 3)),
+  max(2, floor(p / 2)),
+  p
+))
+
+rf_ntree_grid <- c(300, 500, 1000)
+
+rf_grid <- expand.grid(
+  mtry = rf_mtry_grid,
+  ntree = rf_ntree_grid
+) %>%
+  as_tibble() %>%
+  arrange(mtry, ntree)
+
+rf_tuning_results <- pmap_dfr(rf_grid, function(mtry, ntree) {
+  fit <- ranger(
+    x = x_train,
+    y = y_train,
+    mtry = mtry,
+    num.trees = ntree,
+    importance = "impurity"
+  )
+  
+  tibble(
+    mtry = mtry,
+    ntree = ntree,
+    OOB_MSE = extract_oob_mse(fit),
+    OOB_R2 = extract_oob_rsq(fit)
+  )
+})
+
+rf_tuning_results %>%
+  arrange(OOB_MSE) %>%
+  kable(digits = 5, caption = "Random Forest Tuning Results")
+
+best_rf_params <- rf_tuning_results %>%
+  arrange(OOB_MSE) %>%
+  slice(1)
+
+best_mtry <- best_rf_params$mtry
+best_rf_ntree <- best_rf_params$ntree
+
+cat("Best mtry for random forest:", best_mtry, "\n")
+cat("Best ntree for random forest:", best_rf_ntree, "\n")
+
+set.seed(5703)
+rf_model <- ranger(
+  x = x_train,
+  y = y_train,
+  mtry = best_mtry,
+  num.trees = best_rf_ntree,
+  importance = "impurity"
+)
+
+rf_model
+rf_importance_values <- sort(importance(rf_model), decreasing = TRUE)
+barplot(
+  head(rf_importance_values, 15),
+  las = 2,
+  cex.names = 0.7,
+  main = "Top 15 Random Forest Variable Importance",
+  ylab = "Importance"
+)
+
+pred_log_rf <- predict(rf_model, data = x_test)$predictions
+
+rf_test_metrics <- print_price_metrics(
+  "Random Forest Test Metrics:",
+  pred_log_rf,
+  test_df$price
+)
+```
+
+# Boosting
+Boosting builds trees sequentially, with each new tree focusing on errors made by the previous ones. Here we tune interaction depth, shrinkage, and minimum node size, then choose the best number of trees by cross-validation for each combination.
+```{r}
+set.seed(5703)
+
+boost_grid <- expand.grid(
+  interaction.depth = c(1, 3, 5),
+  shrinkage = c(0.005, 0.01),
+  n.minobsinnode = c(5, 10),
+  KEEP.OUT.ATTRS = FALSE
+) %>%
+  as_tibble()
+
+boost_tuning_results <- pmap_dfr(boost_grid, function(interaction.depth, shrinkage, n.minobsinnode) {
+  fit <- gbm(
+    log_price ~ . - price,
+    data = train_df,
+    distribution = "gaussian",
+    n.trees = 4000,
+    interaction.depth = interaction.depth,
+    shrinkage = shrinkage,
+    n.minobsinnode = n.minobsinnode,
+    cv.folds = 5,
+    n.cores = N_CORES,
+    bag.fraction = 0.5,
+    verbose = FALSE
+  )
+  
+  best_iter <- gbm.perf(fit, method = "cv", plot.it = FALSE)
+  best_cv_error <- fit$cv.error[best_iter]
+  
+  tibble(
+    interaction.depth = interaction.depth,
+    shrinkage = shrinkage,
+    n.minobsinnode = n.minobsinnode,
+    best_iter = best_iter,
+    CV_Error = best_cv_error
+  )
+})
+
+boost_tuning_results %>%
+  arrange(CV_Error) %>%
+  kable(digits = 5, caption = "Boosting tuning results based on 5-fold CV")
+
+best_boost_params <- boost_tuning_results %>%
+  arrange(CV_Error) %>%
+  slice(1)
+
+cat("Best boosting depth:", best_boost_params$interaction.depth, "\n")
+cat("Best boosting shrinkage:", best_boost_params$shrinkage, "\n")
+cat("Best boosting n.minobsinnode:", best_boost_params$n.minobsinnode, "\n")
+cat("Best boosting number of trees:", best_boost_params$best_iter, "\n")
+
+boost_model <- gbm(
+  log_price ~ . - price,
+  data = train_df,
+  distribution = "gaussian",
+  n.trees = best_boost_params$best_iter,
+  interaction.depth = best_boost_params$interaction.depth,
+  shrinkage = best_boost_params$shrinkage,
+  n.minobsinnode = best_boost_params$n.minobsinnode,
+  n.cores = N_CORES,
+  bag.fraction = 0.5,
+  verbose = FALSE
+)
+
+summary(boost_model)
+
+pred_log_boost <- predict(
+  boost_model,
+  newdata = test_df,
+  n.trees = best_boost_params$best_iter
+)
+
+boost_test_metrics <- print_price_metrics(
+  "Boosting Test Metrics:",
+  pred_log_boost,
+  test_df$price
+)
+```
+
+# Model Comparison
+This table compares the benchmark tree and the three required ensemble methods using the same held-out test set.
+```{r}
+comparison_table <- bind_rows(
+  tibble(
+    Method = "Decision Tree",
+    Tuning = paste0("cp = ", round(best_cp, 5)),
+    RMSE = tree_test_metrics$RMSE,
+    MAE = tree_test_metrics$MAE,
+    MSE = tree_test_metrics$MSE,
+    R2 = tree_test_metrics$R2
+  ),
+  tibble(
+    Method = "Bagging",
+    Tuning = paste0("ntree = ", best_bag_ntree, ", mtry = ", p),
+    RMSE = bagging_test_metrics$RMSE,
+    MAE = bagging_test_metrics$MAE,
+    MSE = bagging_test_metrics$MSE,
+    R2 = bagging_test_metrics$R2
+  ),
+  tibble(
+    Method = "Random Forest",
+    Tuning = paste0("ntree = ", best_rf_ntree, ", mtry = ", best_mtry),
+    RMSE = rf_test_metrics$RMSE,
+    MAE = rf_test_metrics$MAE,
+    MSE = rf_test_metrics$MSE,
+    R2 = rf_test_metrics$R2
+  ),
+  tibble(
+    Method = "Boosting",
+    Tuning = paste0(
+      "n.trees = ", best_boost_params$best_iter,
+      ", depth = ", best_boost_params$interaction.depth,
+      ", shrinkage = ", best_boost_params$shrinkage,
+      ", n.minobsinnode = ", best_boost_params$n.minobsinnode
+    ),
+    RMSE = boost_test_metrics$RMSE,
+    MAE = boost_test_metrics$MAE,
+    MSE = boost_test_metrics$MSE,
+    R2 = boost_test_metrics$R2
+  )
+) %>%
+  arrange(RMSE)
+
+kable(
+  comparison_table,
+  digits = 4,
+  caption = "Comparison of Decision Tree, Bagging, Random Forest, and Boosting"
+)
+```
+
+# Variable Importance
+These plots help interpret which predictors matter most for the ensemble tree methods.
+```{r}
+importance_rf <- importance(rf_model)
+importance_bag <- importance(bagging_model)
+
+rf_importance_df <- data.frame(
+  Variable = names(importance_rf),
+  Importance = as.numeric(importance_rf)
+) %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = 15)
+
+bag_importance_df <- data.frame(
+  Variable = names(importance_bag),
+  Importance = as.numeric(importance_bag)
+) %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = 15)
+
+kable(rf_importance_df, digits = 4, caption = "Top 15 Random Forest Importance Values")
+kable(bag_importance_df, digits = 4, caption = "Top 15 Bagging Importance Values")
+```
+
+# Interpretation of Results
+Based on the comparison table, the best model should be identified primarily by the lowest RMSE and MAE, along with the highest R^2 on the test set.
+In general:
+The decision tree serves as a simple benchmark and is usually less accurate than the ensemble methods.
+Bagging often improves over a single tree by reducing variance.
+Random forest often improves further by decorrelating trees through random predictor selection.
+Boosting can perform very well because it builds trees sequentially to correct earlier errors.
+The final recommendation should be based on the model that performs best on the held-out test set while remaining interpretable and appropriately tuned.
+
+# Final Conclusion
+This project applied the three required ensemble tree methods from Chapter 8 to a house price prediction problem:
+Bagging
+Random Forest
+Boosting
+All models were trained on the same training set and evaluated on the same test set using regression metrics:
+RMSE
+MAE
+MSE
+R^2
+This provides a fair comparison of predictive performance. The final selected model should be the one with the strongest test-set performance, supported by a clear interpretation of why its results make sense for this dataset.
