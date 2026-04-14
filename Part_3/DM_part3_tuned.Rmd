@@ -41,6 +41,7 @@ suppressPackageStartupMessages({
   library(knitr)
   library(ranger)
   library(parallel)
+  library(pdp)
 })
 
 N_CORES <- max(1, detectCores() - 1)   # leave 1 core free
@@ -92,7 +93,7 @@ extract_oob_rsq <- function(rf_fit) {
 # Data Description and Loading
 The dataset used is kc_house_data.csv. The response variable is price. Because house prices are strongly right-skewed, we model log(price) and then transform predictions back to the original price scale for evaluation.
 ```{r}
-df_raw <- read.csv("data/kc_house_data.csv")
+df_raw <- read.csv("kc_house_data.csv")
 str(df_raw)
 summary(df_raw$price)
 ```
@@ -199,6 +200,18 @@ tree_model <- rpart(
 printcp(tree_model)
 plotcp(tree_model)
 
+tree_cp_df <- as.data.frame(tree_model$cptable)
+
+ggplot(tree_cp_df, aes(x = nsplit, y = xerror)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Decision Tree Cross-Validation Error vs Tree Size",
+    x = "Number of Splits",
+    y = "Cross-Validated Relative Error"
+  ) +
+  theme_minimal()
+
 best_cp <- tree_model$cptable[
   which.min(tree_model$cptable[, "xerror"]),
   "CP"
@@ -242,6 +255,16 @@ bagging_tuning_results <- map_dfr(bag_ntree_grid, function(nt) {
     OOB_R2 = extract_oob_rsq(fit)
   )
 })
+
+ggplot(bagging_tuning_results, aes(x = ntree, y = OOB_MSE)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Bagging OOB Error vs Number of Trees",
+    x = "Number of Trees",
+    y = "OOB MSE"
+  ) +
+  theme_minimal()
 
 kable(
   bagging_tuning_results,
@@ -326,6 +349,24 @@ rf_tuning_results <- pmap_dfr(rf_grid, function(mtry, ntree) {
 rf_tuning_results %>%
   arrange(OOB_MSE) %>%
   kable(digits = 5, caption = "Random Forest Tuning Results")
+
+best_rf_mtry_plot <- rf_tuning_results %>%
+  arrange(OOB_MSE) %>%
+  slice(1) %>%
+  pull(mtry)
+
+rf_ntree_plot_df <- rf_tuning_results %>%
+  filter(mtry == best_rf_mtry_plot)
+
+ggplot(rf_ntree_plot_df, aes(x = ntree, y = OOB_MSE)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = paste("Random Forest OOB Error vs Number of Trees (mtry =", best_rf_mtry_plot, ")"),
+    x = "Number of Trees",
+    y = "OOB MSE"
+  ) +
+  theme_minimal()
 
 best_rf_params <- rf_tuning_results %>%
   arrange(OOB_MSE) %>%
@@ -426,10 +467,28 @@ boost_model <- gbm(
   interaction.depth = best_boost_params$interaction.depth,
   shrinkage = best_boost_params$shrinkage,
   n.minobsinnode = best_boost_params$n.minobsinnode,
+  cv.folds = 5,
   n.cores = N_CORES,
   bag.fraction = 0.5,
   verbose = FALSE
 )
+
+boost_cv_df <- data.frame(
+  Trees = seq_along(boost_model$cv.error),
+  CV_Error = boost_model$cv.error
+)
+
+best_iter_final <- gbm.perf(boost_model, method = "cv", plot.it = FALSE)
+
+ggplot(boost_cv_df, aes(x = Trees, y = CV_Error)) +
+  geom_line() +
+  geom_vline(xintercept = best_iter_final, linetype = "dashed") +
+  labs(
+    title = "Boosting Cross-Validation Error vs Number of Trees",
+    x = "Number of Trees",
+    y = "CV Error"
+  ) +
+  theme_minimal()
 
 summary(boost_model)
 
@@ -444,6 +503,24 @@ boost_test_metrics <- print_price_metrics(
   pred_log_boost,
   test_df$price
 )
+```
+
+# Partial Dependence Plot
+```{r}
+rf_zip_pdp <- partial(
+  object = rf_model,
+  pred.var = "zipcode_log_median",
+  train = x_train,
+  grid.resolution = 20
+)
+
+autoplot(rf_zip_pdp) +
+  labs(
+    title = "Partial Dependence Plot for Zipcode Encoding",
+    x = "Zipcode Log Median",
+    y = "Predicted log(Price)"
+  ) +
+  theme_minimal()
 ```
 
 # Model Comparison
@@ -500,8 +577,16 @@ kable(
 # Variable Importance
 These plots help interpret which predictors matter most for the ensemble tree methods.
 ```{r}
+
+boost_importance <- summary(boost_model, plotit = FALSE)
 importance_rf <- importance(rf_model)
 importance_bag <- importance(bagging_model)
+importance_tree <- pruned_tree$variable.importance
+
+boost_importance_df <- boost_importance %>%
+  select(Variable = var, Importance = rel.inf) %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = 15)
 
 rf_importance_df <- data.frame(
   Variable = names(importance_rf),
@@ -517,27 +602,15 @@ bag_importance_df <- data.frame(
   arrange(desc(Importance)) %>%
   slice_head(n = 15)
 
+tree_importance_df <- data.frame(
+  Variable = names(importance_tree),
+  Importance = as.numeric(importance_tree)
+) %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = 15)
+
+kable(boost_importance_df, digits = 4, caption = "Top 15 Boosting Importance Values")
 kable(rf_importance_df, digits = 4, caption = "Top 15 Random Forest Importance Values")
 kable(bag_importance_df, digits = 4, caption = "Top 15 Bagging Importance Values")
+kable(tree_importance_df, digits = 4, caption = "Top 15 Decision Tree Importance Values")
 ```
-
-# Interpretation of Results
-Based on the comparison table, the best model should be identified primarily by the lowest RMSE and MAE, along with the highest R^2 on the test set.
-In general:
-The decision tree serves as a simple benchmark and is usually less accurate than the ensemble methods.
-Bagging often improves over a single tree by reducing variance.
-Random forest often improves further by decorrelating trees through random predictor selection.
-Boosting can perform very well because it builds trees sequentially to correct earlier errors.
-The final recommendation should be based on the model that performs best on the held-out test set while remaining interpretable and appropriately tuned.
-
-# Final Conclusion
-This project applied the three required ensemble tree methods from Chapter 8 to a house price prediction problem:
-Bagging
-Random Forest
-Boosting
-All models were trained on the same training set and evaluated on the same test set using regression metrics:
-RMSE
-MAE
-MSE
-R^2
-This provides a fair comparison of predictive performance. The final selected model should be the one with the strongest test-set performance, supported by a clear interpretation of why its results make sense for this dataset.

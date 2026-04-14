@@ -87,6 +87,19 @@ We convert appropriate variables to factors, create a log-transformed response, 
 ```{r}
 df <- df_raw %>%
   mutate(
+    # Convert to proper datetime
+    date = as.POSIXct(date, format = "%Y%m%dT%H%M%S"),
+    
+    # Extract useful features
+    sale_year  = as.numeric(format(date, "%Y")),
+    sale_month = as.numeric(format(date, "%m")),
+    sale_day   = as.numeric(format(date, "%d")),
+    sale_dow   = as.numeric(format(date, "%u")),  # day of week (1–7)
+    
+    # Optional: continuous time feature
+    sale_time_numeric = as.numeric(date),
+    
+    # Existing transformations
     zipcode = factor(zipcode),
     waterfront = factor(waterfront),
     view = factor(view),
@@ -95,11 +108,9 @@ df <- df_raw %>%
     log_price = log(price)
   )
 
-# Drop identifier / raw date fields if present
+# Drop raw date + id
 drop_cols <- intersect(names(df), c("id", "date"))
 df_model <- df %>% select(-all_of(drop_cols))
-
-glimpse(df_model)
 ```
 
 # Train/Test Split
