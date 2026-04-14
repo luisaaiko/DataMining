@@ -503,6 +503,31 @@ boost_test_metrics <- print_price_metrics(
   pred_log_boost,
   test_df$price
 )
+
+# Residual Analysis for Boosting 
+actual_price <- test_df$price
+pred_price <- exp(pred_log_boost)
+residuals <- actual_price - pred_price
+
+# Residual Plot
+plot(pred_price, residuals,
+     xlab = "Predicted Price",
+     ylab = "Residuals",
+     main = "Residual Plot (Boosting Model)")
+abline(h = 0, lwd = 2)
+
+# Actual vs Predicted
+plot(actual_price, pred_price,
+     xlab = "Actual Price",
+     ylab = "Predicted Price",
+     main = "Actual vs Predicted (Boosting Model)")
+abline(0, 1, lwd = 2)
+
+# Residual Distribution
+hist(residuals,
+     breaks = 30,
+     main = "Residual Distribution (Boosting Model)",
+     xlab = "Residuals")
 ```
 
 # Partial Dependence Plot
