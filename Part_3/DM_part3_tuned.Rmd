@@ -231,6 +231,11 @@ tree_test_metrics <- print_price_metrics(
   test_df$price
 )
 ```
+```{r}
+smaller_tree <- prune(pruned_tree, cp = 0.01)
+rpart.plot(smaller_tree)
+```
+
 
 # Bagging
 Bagging fits many trees using bootstrap samples and averages the predictions. For bagging, the number of variables tried at each split is set equal to the total number of predictors, so mtry = p.
@@ -490,7 +495,16 @@ ggplot(boost_cv_df, aes(x = Trees, y = CV_Error)) +
   ) +
   theme_minimal()
 
-summary(boost_model)
+boost_importance_values <- summary(boost_model, plotit = FALSE)
+gbm_importance_values <- boost_importance_values$rel.inf
+names(gbm_importance_values) <- boost_importance_values$var
+barplot(
+  head(gbm_importance_values, 15),
+  las = 2,
+  cex.names = 0.7,
+  main = "Top 15 boosting Variable Importance",
+  ylab = "Relative Influence"
+)
 
 pred_log_boost <- predict(
   boost_model,
@@ -532,14 +546,15 @@ hist(residuals,
 
 # Partial Dependence Plot
 ```{r}
-rf_zip_pdp <- partial(
-  object = rf_model,
+boost_zip_pdp <- partial(
+  object = boost_model,
   pred.var = "zipcode_log_median",
   train = x_train,
-  grid.resolution = 20
+  grid.resolution = 20,
+  n.trees = 4000
 )
 
-autoplot(rf_zip_pdp) +
+autoplot(boost_zip_pdp) +
   labs(
     title = "Partial Dependence Plot for Zipcode Encoding",
     x = "Zipcode Log Median",
